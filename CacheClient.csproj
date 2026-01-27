@@ -1,0 +1,27 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- This must be a class library -->
+    <TargetFramework>net8.0</TargetFramework>
+
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <!-- NuGet package metadata -->
+    <PackageId>CacheClient</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Rizwan Farooq</Authors>
+    <Company>YourCompany</Company>
+    <Description>Thin .NET client library for communicating with the Cache Server</Description>
+    <PackageTags>cache tcp client</PackageTags>
+    <RepositoryUrl>https://github.com/your-repo</RepositoryUrl>
+
+    <!-- Optional but recommended -->
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+  </ItemGroup>
+
+</Project>
