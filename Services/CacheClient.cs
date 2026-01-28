@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net.Sockets;
 using System.Text;
 using CacheClient.Models;
@@ -11,23 +12,24 @@ public sealed class CacheClient : ICache
     private bool _initialized;
 
     // Notification support
-    private TcpClient _notificationClient;
-    private CancellationTokenSource _notificationCts;
-    private Task _notificationTask;
+    private TcpClient? _notificationClient;
+    private CancellationTokenSource? _notificationCts;
+    private Task? _notificationTask;
 
-    // Events
-    public event EventHandler<CacheEventArgs> OnItemAdded;
-    public event EventHandler<CacheEventArgs> OnItemUpdated;
-    public event EventHandler<CacheEventArgs> OnItemRemoved;
-    public event EventHandler<CacheEventArgs> OnItemExpired;
-    public event EventHandler<CacheEventArgs> OnItemEvicted;
-    public event EventHandler<CacheEventArgs> OnCacheEvent;
+    // Events (renamed to follow .NET conventions - no "On" prefix)
+    public event EventHandler<CacheEventArgs>? ItemAdded;
+    public event EventHandler<CacheEventArgs>? ItemUpdated;
+    public event EventHandler<CacheEventArgs>? ItemRemoved;
+    public event EventHandler<CacheEventArgs>? ItemExpired;
+    public event EventHandler<CacheEventArgs>? ItemEvicted;
+    public event EventHandler<CacheEventArgs>? CacheEvent;
 
     public bool IsSubscribed => _notificationClient?.Connected ?? false;
 
     public CacheClient(CacheClientOptions options)
     {
-        _options = options ?? throw new ArgumentNullException(nameof(options));
+        ArgumentNullException.ThrowIfNull(options);
+        _options = options;
     }
 
     public void Initialize()
@@ -36,17 +38,17 @@ public sealed class CacheClient : ICache
         _initialized = true;
     }
 
-    public void Add(string key, object value)
+    public void Add(string key, object? value)
     {
         Add(key, value, null);
     }
 
-    public void Add(string key, object value, int expirationSeconds)
+    public void Add(string key, object? value, int expirationSeconds)
     {
         Add(key, value, (int?)expirationSeconds);
     }
 
-    private void Add(string key, object value, int? expirationSeconds)
+    private void Add(string key, object? value, int? expirationSeconds)
     {
         var response = Send("CREATE", key, value, expirationSeconds);
 
@@ -54,24 +56,23 @@ public sealed class CacheClient : ICache
             throw new CacheClientException("Duplicate key.");
     }
 
-    public object Get(string key)
+    public object? Get(string key)
     {
         var response = Send("READ", key);
-
         return response.Value;
     }
 
-    public void Update(string key, object value)
+    public void Update(string key, object? value)
     {
         Update(key, value, null);
     }
 
-    public void Update(string key, object value, int expirationSeconds)
+    public void Update(string key, object? value, int expirationSeconds)
     {
         Update(key, value, (int?)expirationSeconds);
     }
 
-    private void Update(string key, object value, int? expirationSeconds)
+    private void Update(string key, object? value, int? expirationSeconds)
     {
         var response = Send("UPDATE", key, value, expirationSeconds);
 
@@ -96,10 +97,9 @@ public sealed class CacheClient : ICache
         Subscribe(null, eventTypes);
     }
 
-    public void Subscribe(string keyPattern, params CacheEventType[] eventTypes)
+    public void Subscribe(string? keyPattern, params CacheEventType[] eventTypes)
     {
-        if (!_initialized)
-            throw new InvalidOperationException("Cache client not initialized.");
+        ObjectDisposedException.ThrowIf(!_initialized, this);
 
         if (IsSubscribed)
             throw new InvalidOperationException("Already subscribed. Call Unsubscribe() first.");
@@ -136,14 +136,14 @@ public sealed class CacheClient : ICache
         {
             // Send unsubscribe request
             var request = new CacheRequest { Operation = "UNSUBSCRIBE" };
-            var stream = _notificationClient.GetStream();
+            var stream = _notificationClient!.GetStream();
             var json = JsonConvert.SerializeObject(request);
             var bytes = Encoding.UTF8.GetBytes(json);
             stream.Write(bytes, 0, bytes.Length);
         }
-        catch
+        catch (Exception ex)
         {
-            // Ignore errors during unsubscribe
+            Debug.WriteLine($"Error during unsubscribe: {ex.Message}");
         }
 
         _notificationCts?.Cancel();
@@ -152,9 +152,9 @@ public sealed class CacheClient : ICache
         {
             _notificationTask?.Wait(TimeSpan.FromSeconds(2));
         }
-        catch
+        catch (AggregateException ex)
         {
-            // Ignore timeout
+            Debug.WriteLine($"Error waiting for notification task: {ex.Message}");
         }
 
         _notificationClient?.Close();
@@ -165,6 +165,8 @@ public sealed class CacheClient : ICache
 
     private async Task ListenForNotificationsAsync(CancellationToken ct)
     {
+        if (_notificationClient is null) return;
+
         var stream = _notificationClient.GetStream();
         var buffer = new byte[8192];
         var messageBuffer = new StringBuilder();
@@ -173,7 +175,7 @@ public sealed class CacheClient : ICache
         {
             try
             {
-                int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, ct);
+                int bytesRead = await stream.ReadAsync(buffer, ct).ConfigureAwait(false);
                 if (bytesRead == 0) break;
 
                 string data = Encoding.UTF8.GetString(buffer, 0, bytesRead);
@@ -185,23 +187,23 @@ public sealed class CacheClient : ICache
 
                 if (lastNewline >= 0)
                 {
-                    string completeMessages = content.Substring(0, lastNewline);
+                    string completeMessages = content[..lastNewline];
                     messageBuffer.Clear();
-                    messageBuffer.Append(content.Substring(lastNewline + 1));
+                    messageBuffer.Append(content[(lastNewline + 1)..]);
 
                     foreach (var message in completeMessages.Split('\n', StringSplitOptions.RemoveEmptyEntries))
                     {
                         try
                         {
                             var response = JsonConvert.DeserializeObject<CacheResponse>(message);
-                            if (response?.IsNotification == true && response.Event != null)
+                            if (response?.IsNotification == true && response.Event is not null)
                             {
                                 RaiseEvent(response.Event);
                             }
                         }
-                        catch
+                        catch (JsonException ex)
                         {
-                            // Skip malformed messages
+                            Debug.WriteLine($"Malformed notification message: {ex.Message}");
                         }
                     }
                 }
@@ -210,9 +212,9 @@ public sealed class CacheClient : ICache
             {
                 break;
             }
-            catch
+            catch (Exception ex)
             {
-                // Connection lost or other error
+                Debug.WriteLine($"Notification listener error: {ex.Message}");
                 break;
             }
         }
@@ -226,24 +228,24 @@ public sealed class CacheClient : ICache
         switch (cacheEvent.EventType)
         {
             case CacheEventType.ItemAdded:
-                OnItemAdded?.Invoke(this, args);
+                ItemAdded?.Invoke(this, args);
                 break;
             case CacheEventType.ItemUpdated:
-                OnItemUpdated?.Invoke(this, args);
+                ItemUpdated?.Invoke(this, args);
                 break;
             case CacheEventType.ItemRemoved:
-                OnItemRemoved?.Invoke(this, args);
+                ItemRemoved?.Invoke(this, args);
                 break;
             case CacheEventType.ItemExpired:
-                OnItemExpired?.Invoke(this, args);
+                ItemExpired?.Invoke(this, args);
                 break;
             case CacheEventType.ItemEvicted:
-                OnItemEvicted?.Invoke(this, args);
+                ItemEvicted?.Invoke(this, args);
                 break;
         }
 
         // Raise catch-all event
-        OnCacheEvent?.Invoke(this, args);
+        CacheEvent?.Invoke(this, args);
     }
 
     #endregion
@@ -254,13 +256,9 @@ public sealed class CacheClient : ICache
         _initialized = false;
     }
 
-    // -------------------------
-    // Internal Driver Method
-    // -------------------------
-    private CacheResponse Send(string operation, string key, object value = null, int? expirationSeconds = null)
+    private CacheResponse Send(string operation, string? key, object? value = null, int? expirationSeconds = null)
     {
-        if (!_initialized)
-            throw new InvalidOperationException("Cache client not initialized.");
+        ObjectDisposedException.ThrowIf(!_initialized, this);
 
         var request = new CacheRequest
         {
@@ -285,7 +283,8 @@ public sealed class CacheClient : ICache
         int read = stream.Read(buffer, 0, buffer.Length);
 
         var responseJson = Encoding.UTF8.GetString(buffer, 0, read);
-        var response = JsonConvert.DeserializeObject<CacheResponse>(responseJson);
+        var response = JsonConvert.DeserializeObject<CacheResponse>(responseJson)
+            ?? throw new CacheClientException("Invalid response from server");
 
         if (!string.IsNullOrWhiteSpace(response.Error))
             throw new CacheClientException(response.Error);
