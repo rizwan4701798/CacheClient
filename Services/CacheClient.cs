@@ -11,12 +11,10 @@ public sealed class CacheClient : ICache
     private readonly CacheClientOptions _options;
     private bool _initialized;
 
-    // Notification support
     private TcpClient? _notificationClient;
     private CancellationTokenSource? _notificationCts;
     private Task? _notificationTask;
 
-    // Events (renamed to follow .NET conventions - no "On" prefix)
     public event EventHandler<CacheEventArgs>? ItemAdded;
     public event EventHandler<CacheEventArgs>? ItemUpdated;
     public event EventHandler<CacheEventArgs>? ItemRemoved;
@@ -34,7 +32,6 @@ public sealed class CacheClient : ICache
 
     public void Initialize()
     {
-        // No persistent connection required (thin client)
         _initialized = true;
     }
 
@@ -106,9 +103,8 @@ public sealed class CacheClient : ICache
 
         _notificationClient = new TcpClient();
         _notificationClient.Connect(_options.Host, _options.NotificationPort);
-        _notificationClient.ReceiveTimeout = 0; // No timeout for notification stream
+        _notificationClient.ReceiveTimeout = 0; 
 
-        // Send subscription request
         var request = new CacheRequest
         {
             Operation = "SUBSCRIBE",
@@ -123,7 +119,6 @@ public sealed class CacheClient : ICache
         var bytes = Encoding.UTF8.GetBytes(json);
         stream.Write(bytes, 0, bytes.Length);
 
-        // Start listening for notifications
         _notificationCts = new CancellationTokenSource();
         _notificationTask = Task.Run(() => ListenForNotificationsAsync(_notificationCts.Token));
     }
@@ -134,7 +129,6 @@ public sealed class CacheClient : ICache
 
         try
         {
-            // Send unsubscribe request
             var request = new CacheRequest { Operation = "UNSUBSCRIBE" };
             var stream = _notificationClient!.GetStream();
             var json = JsonConvert.SerializeObject(request);
@@ -181,7 +175,6 @@ public sealed class CacheClient : ICache
                 string data = Encoding.UTF8.GetString(buffer, 0, bytesRead);
                 messageBuffer.Append(data);
 
-                // Process complete messages (delimited by newline)
                 string content = messageBuffer.ToString();
                 int lastNewline = content.LastIndexOf('\n');
 
