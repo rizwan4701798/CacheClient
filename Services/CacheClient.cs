@@ -1,4 +1,4 @@
-﻿using System.Net.Sockets;
+using System.Net.Sockets;
 using System.Text;
 using CacheClient.Models;
 using Newtonsoft.Json;
@@ -23,7 +23,17 @@ public sealed class CacheClient : ICache
 
     public void Add(string key, object value)
     {
-        var response = Send("CREATE", key, value);
+        Add(key, value, null);
+    }
+
+    public void Add(string key, object value, int expirationSeconds)
+    {
+        Add(key, value, (int?)expirationSeconds);
+    }
+
+    private void Add(string key, object value, int? expirationSeconds)
+    {
+        var response = Send("CREATE", key, value, expirationSeconds);
 
         if (!response.Success)
             throw new CacheClientException("Duplicate key.");
@@ -38,7 +48,17 @@ public sealed class CacheClient : ICache
 
     public void Update(string key, object value)
     {
-        var response = Send("UPDATE", key, value);
+        Update(key, value, null);
+    }
+
+    public void Update(string key, object value, int expirationSeconds)
+    {
+        Update(key, value, (int?)expirationSeconds);
+    }
+
+    private void Update(string key, object value, int? expirationSeconds)
+    {
+        var response = Send("UPDATE", key, value, expirationSeconds);
 
         if (!response.Success)
             throw new CacheClientException("Key does not exist.");
@@ -63,7 +83,7 @@ public sealed class CacheClient : ICache
     // -------------------------
     // Internal Driver Method
     // -------------------------
-    private CacheResponse Send(string operation, string key, object value = null)
+    private CacheResponse Send(string operation, string key, object value = null, int? expirationSeconds = null)
     {
         if (!_initialized)
             throw new InvalidOperationException("Cache client not initialized.");
@@ -72,7 +92,8 @@ public sealed class CacheClient : ICache
         {
             Operation = operation,
             Key = key,
-            Value = value
+            Value = value,
+            ExpirationSeconds = expirationSeconds
         };
 
         using var client = new TcpClient();
