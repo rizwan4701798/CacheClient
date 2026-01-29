@@ -91,11 +91,6 @@ public sealed class CacheClient : ICache
 
     public void Subscribe(params CacheEventType[] eventTypes)
     {
-        Subscribe(null, eventTypes);
-    }
-
-    public void Subscribe(string? keyPattern, params CacheEventType[] eventTypes)
-    {
         ObjectDisposedException.ThrowIf(!_initialized, this);
 
         if (IsSubscribed)
@@ -110,8 +105,7 @@ public sealed class CacheClient : ICache
             Operation = "SUBSCRIBE",
             SubscribedEventTypes = eventTypes.Length > 0
                 ? eventTypes.Select(e => e.ToString()).ToArray()
-                : null,
-            KeyPattern = keyPattern
+                : null
         };
 
         var stream = _notificationClient.GetStream();
