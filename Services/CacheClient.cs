@@ -110,7 +110,7 @@ public sealed class CacheClient : ICache
             Operation = "SUBSCRIBE",
             SubscribedEventTypes = eventTypes.Length > 0
                 ? eventTypes.Select(e => e.ToString()).ToArray()
-                : null, // null means all events
+                : null,
             KeyPattern = keyPattern
         };
 
