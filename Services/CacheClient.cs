@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using System.Text;
 using CacheClient.Models;
 using Newtonsoft.Json;
+using CacheClient.Constants;
 
 namespace CacheClient;
 
@@ -56,7 +57,7 @@ public sealed class CacheClient : ICache, IDisposable
         }
         catch (Exception ex)
         {
-            throw new CacheClientException($"Failed to connect to server: {ex.Message}", ex);
+            throw new CacheClientException(string.Format(ClientConstants.ConnectionFailed, ex.Message), ex);
         }
     }
     
@@ -70,7 +71,7 @@ public sealed class CacheClient : ICache, IDisposable
             CacheOperation.Create or CacheOperation.Update => new DataRequest(operation, key!, value, expirationSeconds),
             CacheOperation.Read or CacheOperation.Delete => new KeyRequest(operation, key!),
             CacheOperation.Clear => new BasicRequest(operation),
-            _ => throw new ArgumentException($"Unsupported operation for Send: {operation}")
+            _ => throw new ArgumentException(string.Format(ClientConstants.UnsupportedOperation, operation))
         };
         
         var tcs = new TaskCompletionSource<CacheResponse>();
@@ -92,7 +93,7 @@ public sealed class CacheClient : ICache, IDisposable
             // Since ConcurrentQueue doesn't support removal from middle easily, we will fail the specific request if possible
             // But usually this means connection dead.
             // We set exception on TCS to unblock manual waiter if generic.
-            tcs.TrySetException(new CacheClientException("Failed to send request. Connection might be dropped."));
+            tcs.TrySetException(new CacheClientException(ClientConstants.SendRequestFailed));
             throw;
         }
 
@@ -101,7 +102,7 @@ public sealed class CacheClient : ICache, IDisposable
         {
             if (!tcs.Task.Wait(_options.TimeoutMilliseconds))
             {
-                throw new TimeoutException("Request timed out waiting for response.");
+                throw new TimeoutException(ClientConstants.RequestTimedOut);
             }
             return tcs.Task.Result;
         }
@@ -153,7 +154,7 @@ public sealed class CacheClient : ICache, IDisposable
                     }
                     else
                     {
-                         Debug.WriteLine("Received response but no pending request found.");
+                         Debug.WriteLine(ClientConstants.ResponseNoPendingRequest);
                     }
                 }
             }
@@ -161,11 +162,11 @@ public sealed class CacheClient : ICache, IDisposable
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Read loop fatal error: {ex.Message}");
+            Debug.WriteLine(string.Format(ClientConstants.ReadLoopError, ex.Message));
             // Fail all pending requests
             while (_pendingRequests.TryDequeue(out var tcs))
             {
-                tcs.TrySetException(new CacheClientException("Connection lost.", ex));
+                tcs.TrySetException(new CacheClientException(ClientConstants.ConnectionLost, ex));
             }
         }
         finally
@@ -209,7 +210,7 @@ public sealed class CacheClient : ICache, IDisposable
     private void Add(string key, object? value, int? expirationSeconds)
     {
         var response = Send(CacheOperation.Create, key, value, expirationSeconds);
-        if (!response.Success) throw new CacheClientException(response.Error ?? "Unknown error");
+        if (!response.Success) throw new CacheClientException(response.Error ?? ClientConstants.UnknownError);
     }
 
     public object? Get(string key)
@@ -225,7 +226,7 @@ public sealed class CacheClient : ICache, IDisposable
     private void Update(string key, object? value, int? expirationSeconds)
     {
          var response = Send(CacheOperation.Update, key, value, expirationSeconds);
-         if (!response.Success) throw new CacheClientException(response.Error ?? "Key does not exist.");
+         if (!response.Success) throw new CacheClientException(response.Error ?? ClientConstants.KeyDoesNotExist);
     }
 
     public void Remove(string key)
@@ -257,7 +258,7 @@ public sealed class CacheClient : ICache, IDisposable
 
         // Wait for Ack
         if (!tcs.Task.Wait(_options.TimeoutMilliseconds))
-            throw new TimeoutException("Subscribe timed out");
+            throw new TimeoutException(ClientConstants.SubscribeTimedOut);
     }
 
     public void Unsubscribe()
@@ -282,7 +283,7 @@ public sealed class CacheClient : ICache, IDisposable
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Error during unsubscribe: {ex.Message}");
+            Debug.WriteLine(string.Format(ClientConstants.UnsubscribeError, ex.Message));
         }
     }
 
