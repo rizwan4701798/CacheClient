@@ -61,7 +61,7 @@ public sealed class CacheClient : ICache, IDisposable
     }
     
     // Generic Send method using TaskCompletionSource for response matching
-    private CacheResponse Send(string operation, string? key, object? value = null, int? expirationSeconds = null)
+    private CacheResponse Send(CacheOperation operation, string? key, object? value = null, int? expirationSeconds = null)
     {
         ObjectDisposedException.ThrowIf(!_initialized, this);
 
@@ -208,13 +208,13 @@ public sealed class CacheClient : ICache, IDisposable
 
     private void Add(string key, object? value, int? expirationSeconds)
     {
-        var response = Send("CREATE", key, value, expirationSeconds);
+        var response = Send(CacheOperation.Create, key, value, expirationSeconds);
         if (!response.Success) throw new CacheClientException(response.Error ?? "Unknown error");
     }
 
     public object? Get(string key)
     {
-        var response = Send("READ", key);
+        var response = Send(CacheOperation.Read, key);
         return response.Value;
     }
 
@@ -224,18 +224,18 @@ public sealed class CacheClient : ICache, IDisposable
 
     private void Update(string key, object? value, int? expirationSeconds)
     {
-         var response = Send("UPDATE", key, value, expirationSeconds);
+         var response = Send(CacheOperation.Update, key, value, expirationSeconds);
          if (!response.Success) throw new CacheClientException(response.Error ?? "Key does not exist.");
     }
 
     public void Remove(string key)
     {
-        Send("DELETE", key);
+        Send(CacheOperation.Delete, key);
     }
 
     public void Clear()
     {
-        Send("CLEAR", null);
+        Send(CacheOperation.Clear, null);
     }
 
     public void Subscribe(params CacheEventType[] eventTypes)
@@ -245,7 +245,7 @@ public sealed class CacheClient : ICache, IDisposable
         // Just send the SUBSCRIBE command on the existing connection
         var request = new CacheRequest
         {
-             Operation = "SUBSCRIBE",
+             Operation = CacheOperation.Subscribe,
              SubscribedEventTypes = eventTypes.Length > 0
                 ? eventTypes.Select(e => e.ToString()).ToArray()
                 : null
@@ -273,7 +273,7 @@ public sealed class CacheClient : ICache, IDisposable
 
         try
         {
-             var request = new CacheRequest { Operation = "UNSUBSCRIBE" };
+             var request = new CacheRequest { Operation = CacheOperation.Unsubscribe };
              var tcs = new TaskCompletionSource<CacheResponse>();
              
              lock (_writeLock)
