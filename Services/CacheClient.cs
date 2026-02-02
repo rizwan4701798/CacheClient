@@ -97,7 +97,7 @@ public sealed class CacheClient : ICache
             throw new InvalidOperationException("Already subscribed. Call Unsubscribe() first.");
 
         _notificationClient = new TcpClient();
-        _notificationClient.Connect(_options.Host, _options.NotificationPort);
+        _notificationClient.Connect(_options.Host, _options.Port);
         _notificationClient.ReceiveTimeout = 0; 
 
         var request = new CacheRequest
