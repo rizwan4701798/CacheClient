@@ -18,7 +18,6 @@ public sealed class CacheClient : ICache, IDisposable
     private CancellationTokenSource? _connectionCts;
     private Task? _readLoopTask;
     
-    // Queue for pending requests to match responses
     private readonly ConcurrentQueue<TaskCompletionSource<CacheResponse>> _pendingRequests = new();
     private readonly object _writeLock = new();
 
@@ -61,7 +60,6 @@ public sealed class CacheClient : ICache, IDisposable
         }
     }
     
-    // Generic Send method using TaskCompletionSource for response matching
     private CacheResponse Send(CacheOperation operation, string? key, object? value = null, int? expirationSeconds = null)
     {
         ObjectDisposedException.ThrowIf(!_initialized, this);
@@ -89,15 +87,10 @@ public sealed class CacheClient : ICache, IDisposable
         }
         catch (Exception)
         {
-            // If write fails, remove TCS and throw
-            // Since ConcurrentQueue doesn't support removal from middle easily, we will fail the specific request if possible
-            // But usually this means connection dead.
-            // We set exception on TCS to unblock manual waiter if generic.
             tcs.TrySetException(new CacheClientException(ClientConstants.SendRequestFailed));
             throw;
         }
 
-        // Wait for response synchronously to match interface
         try
         {
             if (!tcs.Task.Wait(_options.TimeoutMilliseconds))
@@ -133,12 +126,10 @@ public sealed class CacheClient : ICache, IDisposable
 
                 if (response.IsNotification && response.Event != null)
                 {
-                    // Handle Notification
                     HandleNotification(response.Event);
                 }
                 else
                 {
-                    // Handle Request Response
                     if (_pendingRequests.TryDequeue(out var tcs))
                     {
                         if (response.Success)
@@ -147,8 +138,6 @@ public sealed class CacheClient : ICache, IDisposable
                         }
                         else
                         {
-                            // If server sent error, return it as result so caller can see error message
-                            // or throw? The interface expects Check Success.
                             tcs.TrySetResult(response); 
                         }
                     }
@@ -163,7 +152,6 @@ public sealed class CacheClient : ICache, IDisposable
         catch (Exception ex)
         {
             Debug.WriteLine(string.Format(ClientConstants.ReadLoopError, ex.Message));
-            // Fail all pending requests
             while (_pendingRequests.TryDequeue(out var tcs))
             {
                 tcs.TrySetException(new CacheClientException(ClientConstants.ConnectionLost, ex));
