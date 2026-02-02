@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.Sockets;
 using System.Text;
@@ -6,14 +7,19 @@ using Newtonsoft.Json;
 
 namespace CacheClient;
 
-public sealed class CacheClient : ICache
+public sealed class CacheClient : ICache, IDisposable
 {
     private readonly CacheClientOptions _options;
     private bool _initialized;
-
-    private TcpClient? _notificationClient;
-    private CancellationTokenSource? _notificationCts;
-    private Task? _notificationTask;
+    
+    private TcpClient? _tcpClient;
+    private NetworkStream? _stream;
+    private CancellationTokenSource? _connectionCts;
+    private Task? _readLoopTask;
+    
+    // Queue for pending requests to match responses
+    private readonly ConcurrentQueue<TaskCompletionSource<CacheResponse>> _pendingRequests = new();
+    private readonly object _writeLock = new();
 
     public event EventHandler<CacheEventArgs>? ItemAdded;
     public event EventHandler<CacheEventArgs>? ItemUpdated;
@@ -22,7 +28,7 @@ public sealed class CacheClient : ICache
     public event EventHandler<CacheEventArgs>? ItemEvicted;
     public event EventHandler<CacheEventArgs>? CacheEvent;
 
-    public bool IsSubscribed => _notificationClient?.Connected ?? false;
+    public bool IsSubscribed => _tcpClient != null && _tcpClient.Connected;
 
     public CacheClient(CacheClientOptions options)
     {
@@ -32,184 +38,145 @@ public sealed class CacheClient : ICache
 
     public void Initialize()
     {
-        _initialized = true;
-    }
+        if (_initialized) return;
 
-    public void Add(string key, object? value)
-    {
-        Add(key, value, null);
-    }
-
-    public void Add(string key, object? value, int expirationSeconds)
-    {
-        Add(key, value, (int?)expirationSeconds);
-    }
-
-    private void Add(string key, object? value, int? expirationSeconds)
-    {
-        var response = Send("CREATE", key, value, expirationSeconds);
-
-        if (!response.Success)
-            throw new CacheClientException("Duplicate key.");
-    }
-
-    public object? Get(string key)
-    {
-        var response = Send("READ", key);
-        return response.Value;
-    }
-
-    public void Update(string key, object? value)
-    {
-        Update(key, value, null);
-    }
-
-    public void Update(string key, object? value, int expirationSeconds)
-    {
-        Update(key, value, (int?)expirationSeconds);
-    }
-
-    private void Update(string key, object? value, int? expirationSeconds)
-    {
-        var response = Send("UPDATE", key, value, expirationSeconds);
-
-        if (!response.Success)
-            throw new CacheClientException("Key does not exist.");
-    }
-
-    public void Remove(string key)
-    {
-        Send("DELETE", key);
-    }
-
-    public void Clear()
-    {
-        Send("CLEAR", null);
-    }
-
-    #region Notification Subscription
-
-    public void Subscribe(params CacheEventType[] eventTypes)
-    {
-        ObjectDisposedException.ThrowIf(!_initialized, this);
-
-        if (IsSubscribed)
-            throw new InvalidOperationException("Already subscribed. Call Unsubscribe() first.");
-
-        _notificationClient = new TcpClient();
-        _notificationClient.Connect(_options.Host, _options.Port);
-        _notificationClient.ReceiveTimeout = 0; 
-
-        var request = new CacheRequest
+        try 
         {
-            Operation = "SUBSCRIBE",
-            SubscribedEventTypes = eventTypes.Length > 0
-                ? eventTypes.Select(e => e.ToString()).ToArray()
-                : null
-        };
-
-        var stream = _notificationClient.GetStream();
-        var json = JsonConvert.SerializeObject(request);
-        var bytes = Encoding.UTF8.GetBytes(json);
-        stream.Write(bytes, 0, bytes.Length);
-
-        _notificationCts = new CancellationTokenSource();
-        _notificationTask = Task.Run(() => ListenForNotificationsAsync(_notificationCts.Token));
-    }
-
-    public void Unsubscribe()
-    {
-        if (!IsSubscribed) return;
-
-        try
-        {
-            var request = new CacheRequest { Operation = "UNSUBSCRIBE" };
-            var stream = _notificationClient!.GetStream();
-            var json = JsonConvert.SerializeObject(request);
-            var bytes = Encoding.UTF8.GetBytes(json);
-            stream.Write(bytes, 0, bytes.Length);
+            _tcpClient = new TcpClient();
+            _tcpClient.Connect(_options.Host, _options.Port);
+            _tcpClient.ReceiveTimeout = 0; // Infinite timeout for the read loop
+            _tcpClient.SendTimeout = _options.TimeoutMilliseconds;
+            
+            _stream = _tcpClient.GetStream();
+            _connectionCts = new CancellationTokenSource();
+            
+            _readLoopTask = Task.Run(() => ReadLoopAsync(_connectionCts.Token));
+            
+            _initialized = true;
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Error during unsubscribe: {ex.Message}");
+            throw new CacheClientException($"Failed to connect to server: {ex.Message}", ex);
         }
+    }
+    
+    // Generic Send method using TaskCompletionSource for response matching
+    private CacheResponse Send(string operation, string? key, object? value = null, int? expirationSeconds = null)
+    {
+        ObjectDisposedException.ThrowIf(!_initialized, this);
 
-        _notificationCts?.Cancel();
+        var request = new CacheRequest
+        {
+            Operation = operation,
+            Key = key,
+            Value = value,
+            ExpirationSeconds = expirationSeconds
+        };
+        
+        var tcs = new TaskCompletionSource<CacheResponse>();
 
         try
         {
-            _notificationTask?.Wait(TimeSpan.FromSeconds(2));
+            lock (_writeLock)
+            {
+                _pendingRequests.Enqueue(tcs);
+                var json = JsonConvert.SerializeObject(request);
+                var bytes = Encoding.UTF8.GetBytes(json);
+                _stream!.Write(bytes, 0, bytes.Length);
+                _stream.Flush();
+            }
         }
-        catch (AggregateException ex)
+        catch (Exception)
         {
-            Debug.WriteLine($"Error waiting for notification task: {ex.Message}");
+            // If write fails, remove TCS and throw
+            // Since ConcurrentQueue doesn't support removal from middle easily, we will fail the specific request if possible
+            // But usually this means connection dead.
+            // We set exception on TCS to unblock manual waiter if generic.
+            tcs.TrySetException(new CacheClientException("Failed to send request. Connection might be dropped."));
+            throw;
         }
 
-        _notificationClient?.Close();
-        _notificationClient = null;
-        _notificationCts?.Dispose();
-        _notificationCts = null;
+        // Wait for response synchronously to match interface
+        try
+        {
+            if (!tcs.Task.Wait(_options.TimeoutMilliseconds))
+            {
+                throw new TimeoutException("Request timed out waiting for response.");
+            }
+            return tcs.Task.Result;
+        }
+        catch (AggregateException ae)
+        {
+            if (ae.InnerException is CacheClientException ce) throw ce;
+            throw ae.InnerException ?? ae;
+        }
     }
 
-    private async Task ListenForNotificationsAsync(CancellationToken ct)
+    private async Task ReadLoopAsync(CancellationToken ct)
     {
-        if (_notificationClient is null) return;
-
-        var stream = _notificationClient.GetStream();
-        var buffer = new byte[8192];
-        var messageBuffer = new StringBuilder();
-
-        while (!ct.IsCancellationRequested && _notificationClient.Connected)
+        try
         {
-            try
+            using var reader = new StreamReader(_stream!, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 1024, leaveOpen: true);
+            using var jsonReader = new JsonTextReader(reader) { CloseInput = false, SupportMultipleContent = true };
+            var serializer = new JsonSerializer();
+
+            while (!ct.IsCancellationRequested && _tcpClient != null && _tcpClient.Connected)
             {
-                int bytesRead = await stream.ReadAsync(buffer, ct).ConfigureAwait(false);
-                if (bytesRead == 0) break;
-
-                string data = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-                messageBuffer.Append(data);
-
-                string content = messageBuffer.ToString();
-                int lastNewline = content.LastIndexOf('\n');
-
-                if (lastNewline >= 0)
+                if (!await jsonReader.ReadAsync(ct).ConfigureAwait(false))
                 {
-                    string completeMessages = content[..lastNewline];
-                    messageBuffer.Clear();
-                    messageBuffer.Append(content[(lastNewline + 1)..]);
+                    break; // End of stream
+                }
 
-                    foreach (var message in completeMessages.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                var response = serializer.Deserialize<CacheResponse>(jsonReader);
+                if (response == null) continue;
+
+                if (response.IsNotification && response.Event != null)
+                {
+                    // Handle Notification
+                    HandleNotification(response.Event);
+                }
+                else
+                {
+                    // Handle Request Response
+                    if (_pendingRequests.TryDequeue(out var tcs))
                     {
-                        try
+                        if (response.Success)
                         {
-                            var response = JsonConvert.DeserializeObject<CacheResponse>(message);
-                            if (response?.IsNotification == true && response.Event is not null)
-                            {
-                                RaiseEvent(response.Event);
-                            }
+                            tcs.TrySetResult(response);
                         }
-                        catch (JsonException ex)
+                        else
                         {
-                            Debug.WriteLine($"Malformed notification message: {ex.Message}");
+                            // If server sent error, return it as result so caller can see error message
+                            // or throw? The interface expects Check Success.
+                            tcs.TrySetResult(response); 
                         }
+                    }
+                    else
+                    {
+                         Debug.WriteLine("Received response but no pending request found.");
                     }
                 }
             }
-            catch (OperationCanceledException)
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Read loop fatal error: {ex.Message}");
+            // Fail all pending requests
+            while (_pendingRequests.TryDequeue(out var tcs))
             {
-                break;
+                tcs.TrySetException(new CacheClientException("Connection lost.", ex));
             }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Notification listener error: {ex.Message}");
-                break;
-            }
+        }
+        finally
+        {
+            _initialized = false;
         }
     }
 
-    private void RaiseEvent(CacheEvent cacheEvent)
+    private void HandleNotification(CacheEvent cacheEvent)
     {
-        var args = new CacheEventArgs(cacheEvent);
+         var args = new CacheEventArgs(cacheEvent);
 
         // Raise specific event
         switch (cacheEvent.EventType)
@@ -235,47 +202,106 @@ public sealed class CacheClient : ICache
         CacheEvent?.Invoke(this, args);
     }
 
-    #endregion
+    public void Add(string key, object? value) => Add(key, value, null);
+
+    public void Add(string key, object? value, int expirationSeconds) => Add(key, value, (int?)expirationSeconds);
+
+    private void Add(string key, object? value, int? expirationSeconds)
+    {
+        var response = Send("CREATE", key, value, expirationSeconds);
+        if (!response.Success) throw new CacheClientException(response.Error ?? "Unknown error");
+    }
+
+    public object? Get(string key)
+    {
+        var response = Send("READ", key);
+        return response.Value;
+    }
+
+    public void Update(string key, object? value) => Update(key, value, null);
+
+    public void Update(string key, object? value, int expirationSeconds) => Update(key, value, (int?)expirationSeconds);
+
+    private void Update(string key, object? value, int? expirationSeconds)
+    {
+         var response = Send("UPDATE", key, value, expirationSeconds);
+         if (!response.Success) throw new CacheClientException(response.Error ?? "Key does not exist.");
+    }
+
+    public void Remove(string key)
+    {
+        Send("DELETE", key);
+    }
+
+    public void Clear()
+    {
+        Send("CLEAR", null);
+    }
+
+    public void Subscribe(params CacheEventType[] eventTypes)
+    {
+        ObjectDisposedException.ThrowIf(!_initialized, this);
+        
+        // Just send the SUBSCRIBE command on the existing connection
+        var request = new CacheRequest
+        {
+             Operation = "SUBSCRIBE",
+             SubscribedEventTypes = eventTypes.Length > 0
+                ? eventTypes.Select(e => e.ToString()).ToArray()
+                : null
+        };
+        
+        var tcs = new TaskCompletionSource<CacheResponse>();
+        
+        lock (_writeLock)
+        {
+            _pendingRequests.Enqueue(tcs);
+            var json = JsonConvert.SerializeObject(request);
+            var bytes = Encoding.UTF8.GetBytes(json);
+            _stream!.Write(bytes, 0, bytes.Length);
+            _stream.Flush();
+        }
+
+        // Wait for Ack
+        if (!tcs.Task.Wait(_options.TimeoutMilliseconds))
+            throw new TimeoutException("Subscribe timed out");
+    }
+
+    public void Unsubscribe()
+    {
+        if (!_initialized) return;
+
+        try
+        {
+             var request = new CacheRequest { Operation = "UNSUBSCRIBE" };
+             var tcs = new TaskCompletionSource<CacheResponse>();
+             
+             lock (_writeLock)
+             {
+                _pendingRequests.Enqueue(tcs);
+                var json = JsonConvert.SerializeObject(request);
+                var bytes = Encoding.UTF8.GetBytes(json);
+                _stream!.Write(bytes, 0, bytes.Length);
+                _stream.Flush();
+             }
+             
+             tcs.Task.Wait(2000); // Wait briefly for ack
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Error during unsubscribe: {ex.Message}");
+        }
+    }
 
     public void Dispose()
     {
-        Unsubscribe();
+        _connectionCts?.Cancel();
+        _tcpClient?.Close();
         _initialized = false;
-    }
-
-    private CacheResponse Send(string operation, string? key, object? value = null, int? expirationSeconds = null)
-    {
-        ObjectDisposedException.ThrowIf(!_initialized, this);
-
-        var request = new CacheRequest
-        {
-            Operation = operation,
-            Key = key,
-            Value = value,
-            ExpirationSeconds = expirationSeconds
-        };
-
-        using var client = new TcpClient();
-        client.Connect(_options.Host, _options.Port);
-        client.ReceiveTimeout = _options.TimeoutMilliseconds;
-        client.SendTimeout = _options.TimeoutMilliseconds;
-
-        using var stream = client.GetStream();
-
-        var json = JsonConvert.SerializeObject(request);
-        var bytes = Encoding.UTF8.GetBytes(json);
-        stream.Write(bytes, 0, bytes.Length);
-
-        var buffer = new byte[4096];
-        int read = stream.Read(buffer, 0, buffer.Length);
-
-        var responseJson = Encoding.UTF8.GetString(buffer, 0, read);
-        var response = JsonConvert.DeserializeObject<CacheResponse>(responseJson)
-            ?? throw new CacheClientException("Invalid response from server");
-
-        if (!string.IsNullOrWhiteSpace(response.Error))
-            throw new CacheClientException(response.Error);
-
-        return response;
+        
+        // Wait for loop to finish?
+        try { _readLoopTask?.Wait(500); } catch { }
+        
+        _connectionCts?.Dispose();
     }
 }
