@@ -124,9 +124,9 @@ public sealed class CacheClient : ICache, IDisposable
                 var response = serializer.Deserialize<CacheResponse>(jsonReader);
                 if (response == null) continue;
 
-                if (response.IsNotification && response.Event != null)
+                if (response.IsNotification && response is NotificationResponse notifResponse && notifResponse.Event != null)
                 {
-                    HandleNotification(response.Event);
+                    HandleNotification(notifResponse.Event);
                 }
                 else
                 {
@@ -204,7 +204,11 @@ public sealed class CacheClient : ICache, IDisposable
     public object? Get(string key)
     {
         var response = Send(CacheOperation.Read, key);
-        return response.Value;
+        if (response is DataResponse dataResponse)
+        {
+             return dataResponse.Value;
+        }
+        return null;
     }
 
     public void Update(string key, object? value) => Update(key, value, null);
