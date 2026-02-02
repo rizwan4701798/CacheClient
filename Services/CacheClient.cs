@@ -65,12 +65,12 @@ public sealed class CacheClient : ICache, IDisposable
     {
         ObjectDisposedException.ThrowIf(!_initialized, this);
 
-        var request = new CacheRequest
+        CacheRequest request = operation switch
         {
-            Operation = operation,
-            Key = key,
-            Value = value,
-            ExpirationSeconds = expirationSeconds
+            CacheOperation.Create or CacheOperation.Update => new DataRequest(operation, key!, value, expirationSeconds),
+            CacheOperation.Read or CacheOperation.Delete => new KeyRequest(operation, key!),
+            CacheOperation.Clear => new BasicRequest(operation),
+            _ => throw new ArgumentException($"Unsupported operation for Send: {operation}")
         };
         
         var tcs = new TaskCompletionSource<CacheResponse>();
@@ -242,14 +242,7 @@ public sealed class CacheClient : ICache, IDisposable
     {
         ObjectDisposedException.ThrowIf(!_initialized, this);
         
-        // Just send the SUBSCRIBE command on the existing connection
-        var request = new CacheRequest
-        {
-             Operation = CacheOperation.Subscribe,
-             SubscribedEventTypes = eventTypes.Length > 0
-                ? eventTypes.Select(e => e.ToString()).ToArray()
-                : null
-        };
+        var request = new SubscriptionRequest(eventTypes.Select(e => e.ToString()).ToArray());
         
         var tcs = new TaskCompletionSource<CacheResponse>();
         
@@ -273,7 +266,7 @@ public sealed class CacheClient : ICache, IDisposable
 
         try
         {
-             var request = new CacheRequest { Operation = CacheOperation.Unsubscribe };
+             var request = new BasicRequest(CacheOperation.Unsubscribe);
              var tcs = new TaskCompletionSource<CacheResponse>();
              
              lock (_writeLock)
