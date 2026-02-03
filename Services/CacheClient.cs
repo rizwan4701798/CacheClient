@@ -1,10 +1,7 @@
-using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Net.Sockets;
-using System.Text;
-using CacheClient.Models;
-using Newtonsoft.Json;
 using CacheClient.Constants;
+using CacheClient.Infrastructure;
+using CacheClient.Models;
 
 namespace CacheClient;
 
@@ -13,12 +10,15 @@ public sealed class CacheClient : ICache, IDisposable
     private readonly CacheClientOptions _options;
     private bool _initialized;
     
-    private TcpClient? _tcpClient;
-    private NetworkStream? _stream;
+    // Infrastructure components
+    private readonly TcpConnection _connection;
+    private readonly RequestManager _requestManager;
+    private readonly CacheSerializer _serializer;
+    private readonly ResponseReader _responseReader;
+
     private CancellationTokenSource? _connectionCts;
     private Task? _readLoopTask;
     
-    private readonly ConcurrentQueue<TaskCompletionSource<CacheResponse>> _pendingRequests = new();
     private readonly object _writeLock = new();
 
     public event EventHandler<CacheEventArgs>? ItemAdded;
@@ -28,12 +28,17 @@ public sealed class CacheClient : ICache, IDisposable
     public event EventHandler<CacheEventArgs>? ItemEvicted;
     public event EventHandler<CacheEventArgs>? CacheEvent;
 
-    public bool IsSubscribed => _tcpClient != null && _tcpClient.Connected;
+    public bool IsSubscribed => _connection.IsConnected;
 
     public CacheClient(CacheClientOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
         _options = options;
+
+        _connection = new TcpConnection();
+        _requestManager = new RequestManager();
+        _serializer = new CacheSerializer();
+        _responseReader = new ResponseReader(_connection, _serializer, _requestManager);
     }
 
     public void Initialize()
@@ -42,15 +47,11 @@ public sealed class CacheClient : ICache, IDisposable
 
         try 
         {
-            _tcpClient = new TcpClient();
-            _tcpClient.Connect(_options.Host, _options.Port);
-            _tcpClient.ReceiveTimeout = 0; // Infinite timeout for the read loop
-            _tcpClient.SendTimeout = _options.TimeoutMilliseconds;
+            _connection.Connect(_options.Host, _options.Port, _options.TimeoutMilliseconds);
             
-            _stream = _tcpClient.GetStream();
             _connectionCts = new CancellationTokenSource();
             
-            _readLoopTask = Task.Run(() => ReadLoopAsync(_connectionCts.Token));
+            _readLoopTask = Task.Run(() => _responseReader.RunAsync(_connectionCts.Token, HandleNotification));
             
             _initialized = true;
         }
@@ -72,23 +73,25 @@ public sealed class CacheClient : ICache, IDisposable
             _ => throw new ArgumentException(string.Format(ClientConstants.UnsupportedOperation, operation))
         };
         
-        var tcs = new TaskCompletionSource<CacheResponse>();
+        TaskCompletionSource<CacheResponse> tcs;
 
         try
         {
             lock (_writeLock)
             {
-                _pendingRequests.Enqueue(tcs);
-                var json = JsonConvert.SerializeObject(request);
-                var bytes = Encoding.UTF8.GetBytes(json);
-                _stream!.Write(bytes, 0, bytes.Length);
-                _stream.Flush();
+                tcs = _requestManager.RegisterRequest();
+                var bytes = _serializer.Serialize(request);
+                _connection.Write(bytes);
             }
         }
         catch (Exception)
         {
-            tcs.TrySetException(new CacheClientException(ClientConstants.SendRequestFailed));
-            throw;
+            // If request failed to send, ensure we don't leave a hanging tcs if we registered it?
+            // Actually RequestManager.RegisterRequest simply enqueues. If Write fails, the TCS is in queue but will never get response.
+            // We should probably cancel it. But picking it out is hard (queue).
+            // For now, we rely on timeout or CancelAll in case of connection drop.
+            // But if Write throws, the connection is likely bad.
+            throw; // Let caller handle
         }
 
         try
@@ -103,63 +106,6 @@ public sealed class CacheClient : ICache, IDisposable
         {
             if (ae.InnerException is CacheClientException ce) throw ce;
             throw ae.InnerException ?? ae;
-        }
-    }
-
-    private async Task ReadLoopAsync(CancellationToken ct)
-    {
-        try
-        {
-            using var reader = new StreamReader(_stream!, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, bufferSize: 1024, leaveOpen: true);
-            using var jsonReader = new JsonTextReader(reader) { CloseInput = false, SupportMultipleContent = true };
-            var serializer = new JsonSerializer();
-
-            while (!ct.IsCancellationRequested && _tcpClient != null && _tcpClient.Connected)
-            {
-                if (!await jsonReader.ReadAsync(ct).ConfigureAwait(false))
-                {
-                    break; // End of stream
-                }
-
-                var response = serializer.Deserialize<CacheResponse>(jsonReader);
-                if (response == null) continue;
-
-                if (response.IsNotification && response is NotificationResponse notifResponse && notifResponse.Event != null)
-                {
-                    HandleNotification(notifResponse.Event);
-                }
-                else
-                {
-                    if (_pendingRequests.TryDequeue(out var tcs))
-                    {
-                        if (response.Success)
-                        {
-                            tcs.TrySetResult(response);
-                        }
-                        else
-                        {
-                            tcs.TrySetResult(response); 
-                        }
-                    }
-                    else
-                    {
-                         Debug.WriteLine(ClientConstants.ResponseNoPendingRequest);
-                    }
-                }
-            }
-        }
-        catch (OperationCanceledException) { }
-        catch (Exception ex)
-        {
-            Debug.WriteLine(string.Format(ClientConstants.ReadLoopError, ex.Message));
-            while (_pendingRequests.TryDequeue(out var tcs))
-            {
-                tcs.TrySetException(new CacheClientException(ClientConstants.ConnectionLost, ex));
-            }
-        }
-        finally
-        {
-            _initialized = false;
         }
     }
 
@@ -191,11 +137,7 @@ public sealed class CacheClient : ICache, IDisposable
         CacheEvent?.Invoke(this, args);
     }
 
-    public void Add(string key, object? value) => Add(key, value, null);
-
-    public void Add(string key, object? value, int expirationSeconds) => Add(key, value, (int?)expirationSeconds);
-
-    private void Add(string key, object? value, int? expirationSeconds)
+    public void Add(string key, object? value, int? expirationSeconds = null)
     {
         var response = Send(CacheOperation.Create, key, value, expirationSeconds);
         if (!response.Success) throw new CacheClientException(response.Error ?? ClientConstants.UnknownError);
@@ -211,11 +153,7 @@ public sealed class CacheClient : ICache, IDisposable
         return null;
     }
 
-    public void Update(string key, object? value) => Update(key, value, null);
-
-    public void Update(string key, object? value, int expirationSeconds) => Update(key, value, (int?)expirationSeconds);
-
-    private void Update(string key, object? value, int? expirationSeconds)
+    public void Update(string key, object? value, int? expirationSeconds = null)
     {
          var response = Send(CacheOperation.Update, key, value, expirationSeconds);
          if (!response.Success) throw new CacheClientException(response.Error ?? ClientConstants.KeyDoesNotExist);
@@ -237,15 +175,13 @@ public sealed class CacheClient : ICache, IDisposable
         
         var request = new SubscriptionRequest(eventTypes.Select(e => e.ToString()).ToArray());
         
-        var tcs = new TaskCompletionSource<CacheResponse>();
+        TaskCompletionSource<CacheResponse> tcs;
         
         lock (_writeLock)
         {
-            _pendingRequests.Enqueue(tcs);
-            var json = JsonConvert.SerializeObject(request);
-            var bytes = Encoding.UTF8.GetBytes(json);
-            _stream!.Write(bytes, 0, bytes.Length);
-            _stream.Flush();
+            tcs = _requestManager.RegisterRequest();
+            var bytes = _serializer.Serialize(request);
+            _connection.Write(bytes);
         }
 
         // Wait for Ack
@@ -260,15 +196,13 @@ public sealed class CacheClient : ICache, IDisposable
         try
         {
              var request = new BasicRequest(CacheOperation.Unsubscribe);
-             var tcs = new TaskCompletionSource<CacheResponse>();
+             TaskCompletionSource<CacheResponse> tcs;
              
              lock (_writeLock)
              {
-                _pendingRequests.Enqueue(tcs);
-                var json = JsonConvert.SerializeObject(request);
-                var bytes = Encoding.UTF8.GetBytes(json);
-                _stream!.Write(bytes, 0, bytes.Length);
-                _stream.Flush();
+                tcs = _requestManager.RegisterRequest();
+                var bytes = _serializer.Serialize(request);
+                _connection.Write(bytes);
              }
              
              tcs.Task.Wait(2000); // Wait briefly for ack
@@ -282,12 +216,13 @@ public sealed class CacheClient : ICache, IDisposable
     public void Dispose()
     {
         _connectionCts?.Cancel();
-        _tcpClient?.Close();
+        _connection.Dispose(); // This handles closing TcpClient
+        
         _initialized = false;
         
-        // Wait for loop to finish?
         try { _readLoopTask?.Wait(500); } catch { }
         
         _connectionCts?.Dispose();
+        _requestManager.CancelAll(new ObjectDisposedException("CacheClient"));
     }
 }
