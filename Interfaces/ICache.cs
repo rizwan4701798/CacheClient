@@ -31,6 +31,6 @@ public interface ICache : IDisposable
 
     void Subscribe(params CacheEventType[] eventTypes);
 
-    void Unsubscribe();
+    void Unsubscribe(params CacheEventType[] eventTypes);
     bool IsSubscribed { get; }
 }

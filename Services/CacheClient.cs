@@ -196,20 +196,29 @@ public sealed class CacheClient : ICache, IDisposable
             throw new TimeoutException(ClientConstants.SubscribeTimedOut);
     }
 
-    public void Unsubscribe()
+    public void Unsubscribe(params CacheEventType[] eventTypes)
     {
         if (!_initialized) return;
 
         try
         {
-             var request = new BasicRequest(CacheOperation.Unsubscribe);
+             CacheRequest request;
+             if (eventTypes != null && eventTypes.Length > 0)
+             {
+                 request = new SubscriptionRequest(CacheOperation.Unsubscribe, eventTypes.Select(e => e.ToString()).ToArray());
+             }
+             else
+             {
+                 request = new BasicRequest(CacheOperation.Unsubscribe);
+             }
+
              TaskCompletionSource<CacheResponse> tcs;
              
              lock (_writeLock)
              {
-                tcs = _requestManager.RegisterRequest();
-                var bytes = _serializer.Serialize(request);
-                _connection.Write(bytes);
+                 tcs = _requestManager.RegisterRequest();
+                 var bytes = _serializer.Serialize(request);
+                 _connection.Write(bytes);
              }
              
              tcs.Task.Wait(2000); 
