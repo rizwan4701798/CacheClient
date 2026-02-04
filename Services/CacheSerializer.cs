@@ -2,7 +2,7 @@ using System.Text;
 using CacheClient.Models;
 using Newtonsoft.Json;
 
-namespace CacheClient.Infrastructure;
+namespace CacheClient.Services;
 
 public class CacheSerializer
 {

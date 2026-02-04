@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using CacheClient.Constants;
-using CacheClient.Infrastructure;
 using CacheClient.Models;
+using CacheClient.Services;
 
 namespace CacheClient;
 
@@ -54,6 +54,14 @@ public sealed class CacheClient : ICache, IDisposable
             _readLoopTask = Task.Run(() => _responseReader.RunAsync(_connectionCts.Token, HandleNotification));
             
             _initialized = true;
+
+                Subscribe(
+                    CacheEventType.ItemAdded, 
+                    CacheEventType.ItemUpdated, 
+                    CacheEventType.ItemRemoved, 
+                    CacheEventType.ItemExpired, 
+                    CacheEventType.ItemEvicted);
+            
         }
         catch (Exception ex)
         {
@@ -184,7 +192,6 @@ public sealed class CacheClient : ICache, IDisposable
             _connection.Write(bytes);
         }
 
-        // Wait for Ack
         if (!tcs.Task.Wait(_options.TimeoutMilliseconds))
             throw new TimeoutException(ClientConstants.SubscribeTimedOut);
     }
@@ -205,7 +212,7 @@ public sealed class CacheClient : ICache, IDisposable
                 _connection.Write(bytes);
              }
              
-             tcs.Task.Wait(2000); // Wait briefly for ack
+             tcs.Task.Wait(2000); 
         }
         catch (Exception ex)
         {
@@ -216,7 +223,7 @@ public sealed class CacheClient : ICache, IDisposable
     public void Dispose()
     {
         _connectionCts?.Cancel();
-        _connection.Dispose(); // This handles closing TcpClient
+        _connection.Dispose(); 
         
         _initialized = false;
         

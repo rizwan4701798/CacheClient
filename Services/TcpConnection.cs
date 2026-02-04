@@ -1,6 +1,6 @@
 using System.Net.Sockets;
 
-namespace CacheClient.Infrastructure;
+namespace CacheClient.Services;
 
 public class TcpConnection : IDisposable
 {

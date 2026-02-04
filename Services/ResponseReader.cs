@@ -3,9 +3,8 @@ using System.Text;
 using CacheClient.Constants;
 using CacheClient.Models;
 using Newtonsoft.Json;
-using CacheClient;
 
-namespace CacheClient.Infrastructure;
+namespace CacheClient.Services;
 
 public class ResponseReader
 {

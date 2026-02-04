@@ -1,7 +1,7 @@
 using System.Collections.Concurrent;
 using CacheClient.Models;
 
-namespace CacheClient.Infrastructure;
+namespace CacheClient.Services;
 
 public class RequestManager
 {
